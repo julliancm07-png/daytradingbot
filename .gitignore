@@ -1,0 +1,12 @@
+.venv/
+.env
+data/*.db
+data/*.db-wal
+data/*.db-shm
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build_milestone1.py
+build_milestone1.ps1
+milestone_1_windows_builder_script.ps1
