@@ -35,6 +35,7 @@ class MarketEvent(BaseModel):
     bar_close: Decimal
     volume_24h_usd: Decimal
     source_status: Literal["ok", "stale", "disconnected"] = "ok"
+    bar_time: Optional[datetime] = None
 
 
 class TradeProposal(BaseModel):
@@ -126,3 +127,13 @@ class EquitySnapshot(BaseModel):
     cumulative_fees_usd: Decimal
     monthly_api_spend_usd: Decimal
     net_equity_after_api_usd: Decimal
+
+
+class WorkerHealthRecord(BaseModel):
+    worker_name: str
+    status: Literal["OK", "DEGRADED", "STALE", "DISCONNECTED", "IDLE", "PAUSED"]
+    last_heartbeat: datetime
+    last_latency_ms: float = 0.0
+    rate_limit_remaining: Optional[int] = None
+    consecutive_errors: int = 0
+    message: str = ""

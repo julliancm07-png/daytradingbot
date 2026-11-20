@@ -4,7 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 try:
     import tomllib
@@ -33,12 +33,46 @@ class FeeSettings(BaseModel):
 
 
 class StrategySettings(BaseModel):
+    strategy_type: Literal["breakout", "mean_reversion"] = "breakout"
     lookback_bars: int = 3
     min_breakout_pct: Decimal = Decimal("0.003")
     order_notional_usd: Decimal = Decimal("50.00")
     stop_loss_pct: Decimal = Decimal("0.025")
     take_profit_pct: Decimal = Decimal("0.045")
     max_hold_seconds: int = 3600
+    trend_ma_bars: int = 0
+    # Mean-reversion parameters (used when strategy_type == "mean_reversion")
+    rsi_period: int = 7
+    rsi_entry_below: Decimal = Decimal("30")
+    rsi_exit_above: Decimal = Decimal("60")
+    mean_exit_sma_bars: int = 10
+
+
+class FeedSettings(BaseModel):
+    crypto_symbols: list[str] = Field(default_factory=lambda: ["BTC/USD", "ETH/USD", "SOL/USD"])
+    stock_symbols: list[str] = Field(default_factory=lambda: ["SPY", "QQQ", "AAPL"])
+    crypto_loc: str = "us"
+    stock_feed: str = "iex"
+    poll_interval_seconds: float = 3.0
+    request_timeout_seconds: float = 8.0
+
+
+class DashboardSettings(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 8000
+    sse_interval_seconds: float = 2.0
+
+
+class LLMSettings(BaseModel):
+    enabled: bool = False
+    mode: Literal["shadow", "filter"] = "shadow"
+    model: str = "google/gemini-2.5-flash-lite"
+    base_url: str = "https://openrouter.ai/api/v1"
+    timeout_seconds: float = 6.0
+    max_tokens: int = 220
+    fallback_on_error: Literal["NO_TRADE", "BASELINE"] = "NO_TRADE"
+    estimated_cost_per_1k_input_usd: Decimal = Decimal("0.0001")
+    estimated_cost_per_1k_output_usd: Decimal = Decimal("0.0004")
 
 
 class AppSettings(BaseModel):
@@ -48,6 +82,9 @@ class AppSettings(BaseModel):
     risk: RiskSettings = RiskSettings()
     fees: FeeSettings = FeeSettings()
     strategy: StrategySettings = StrategySettings()
+    feed: FeedSettings = FeedSettings()
+    dashboard: DashboardSettings = DashboardSettings()
+    llm: LLMSettings = LLMSettings()
 
 
 def load_settings(path: str | Path) -> AppSettings:

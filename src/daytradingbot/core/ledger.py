@@ -14,13 +14,14 @@ from daytradingbot.core.models import (
     MarketEvent,
     OrderRecord,
     PositionRecord,
+    WorkerHealthRecord,
     q_qty,
     q_usd,
 )
 
 
 class Ledger:
-    """SQLite WAL durable store for events, orders, fills, positions, and equity."""
+    """SQLite WAL durable store for events, orders, fills, positions, telemetry, and equity."""
 
     def __init__(self, db_path: str | Path, starting_cash_usd: Decimal) -> None:
         self.db_path = Path(db_path)
@@ -61,6 +62,27 @@ class Ledger:
                 CREATE TABLE IF NOT EXISTS symbol_state (
                     symbol TEXT PRIMARY KEY,
                     last_event_time TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS latest_quotes (
+                    symbol TEXT PRIMARY KEY,
+                    asset_class TEXT NOT NULL,
+                    bid TEXT NOT NULL,
+                    ask TEXT NOT NULL,
+                    spread_bps TEXT NOT NULL,
+                    quote_age_s REAL NOT NULL,
+                    bar_close TEXT NOT NULL,
+                    volume_24h_usd TEXT NOT NULL,
+                    source_status TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS worker_health (
+                    worker_name TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    last_heartbeat TEXT NOT NULL,
+                    last_latency_ms REAL NOT NULL,
+                    rate_limit_remaining INTEGER,
+                    consecutive_errors INTEGER NOT NULL,
+                    message TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,6 +192,10 @@ class Ledger:
             (key, value),
         )
 
+    def get_starting_cash_usd(self) -> Decimal:
+        with self._conn() as conn:
+            return Decimal(self._get_meta(conn, "starting_cash_usd"))
+
     def get_cash_usd(self) -> Decimal:
         with self._conn() as conn:
             return Decimal(self._get_meta(conn, "cash_usd"))
@@ -236,14 +262,99 @@ class Ledger:
                 (event.symbol, event.event_time.isoformat()),
             )
 
+    def upsert_latest_quote(self, event: MarketEvent) -> None:
+        spread_bps = Decimal("0")
+        if event.bid > Decimal("0") and event.ask >= event.bid:
+            mid = (event.bid + event.ask) / Decimal("2")
+            spread_bps = q_usd(((event.ask - event.bid) / mid) * Decimal("10000"))
+        quote_age_s = round((event.received_time - event.event_time).total_seconds(), 2)
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO latest_quotes (
+                    symbol, asset_class, bid, ask, spread_bps, quote_age_s,
+                    bar_close, volume_24h_usd, source_status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    asset_class = excluded.asset_class,
+                    bid = excluded.bid,
+                    ask = excluded.ask,
+                    spread_bps = excluded.spread_bps,
+                    quote_age_s = excluded.quote_age_s,
+                    bar_close = excluded.bar_close,
+                    volume_24h_usd = excluded.volume_24h_usd,
+                    source_status = excluded.source_status,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    event.symbol,
+                    event.asset_class,
+                    str(event.bid),
+                    str(event.ask),
+                    str(spread_bps),
+                    quote_age_s,
+                    str(event.bar_close),
+                    str(event.volume_24h_usd),
+                    event.source_status,
+                    event.received_time.isoformat(),
+                ),
+            )
+
+    def get_latest_quotes(self) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM latest_quotes ORDER BY asset_class ASC, symbol ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_worker_health(self, record: WorkerHealthRecord) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO worker_health (
+                    worker_name, status, last_heartbeat, last_latency_ms,
+                    rate_limit_remaining, consecutive_errors, message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(worker_name) DO UPDATE SET
+                    status = excluded.status,
+                    last_heartbeat = excluded.last_heartbeat,
+                    last_latency_ms = excluded.last_latency_ms,
+                    rate_limit_remaining = excluded.rate_limit_remaining,
+                    consecutive_errors = excluded.consecutive_errors,
+                    message = excluded.message
+                """,
+                (
+                    record.worker_name,
+                    record.status,
+                    record.last_heartbeat.isoformat(),
+                    record.last_latency_ms,
+                    record.rate_limit_remaining,
+                    record.consecutive_errors,
+                    record.message,
+                ),
+            )
+
+    def get_worker_health(self) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM worker_health ORDER BY worker_name ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_recent_bar_highs(self, limit_per_symbol: int) -> dict[str, list[Decimal]]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT symbol, bar_high FROM market_events ORDER BY event_time ASC"
+                "SELECT symbol, bar_high, payload_json FROM market_events ORDER BY event_time ASC"
             ).fetchall()
         grouped: dict[str, list[Decimal]] = {}
+        seen_bar_time: dict[str, Optional[str]] = {}
         for row in rows:
             sym = str(row["symbol"])
+            payload = json.loads(row["payload_json"])
+            bt = payload.get("bar_time")
+            if bt is not None and seen_bar_time.get(sym) == bt:
+                continue
+            seen_bar_time[sym] = bt
             grouped.setdefault(sym, []).append(Decimal(row["bar_high"]))
         return {sym: highs[-limit_per_symbol:] for sym, highs in grouped.items()}
 
@@ -273,6 +384,24 @@ class Ledger:
     def get_audit_log(self) -> list[dict[str, Any]]:
         with self._conn() as conn:
             rows = conn.execute("SELECT * FROM audit_log ORDER BY id ASC").fetchall()
+        return [
+            {
+                "id": r["id"],
+                "ts": r["ts"],
+                "stage": r["stage"],
+                "symbol": r["symbol"],
+                "ref_id": r["ref_id"],
+                "status": r["status"],
+                "details": json.loads(r["details_json"]),
+            }
+            for r in rows
+        ]
+
+    def get_recent_audit_log(self, limit: int = 40) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
         return [
             {
                 "id": r["id"],
@@ -574,6 +703,22 @@ class Ledger:
                     str(snap.net_equity_after_api_usd),
                 ),
             )
+
+    def get_latest_equity_snapshot(self) -> Optional[dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM equity_snapshots ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_equity_history(self, limit: int = 80) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT ts, total_equity_usd, drawdown_pct FROM equity_snapshots "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
 
     @staticmethod
     def _row_to_order(r: sqlite3.Row) -> OrderRecord:

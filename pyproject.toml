@@ -4,12 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daytradingbot"
-version = "0.1.0"
-description = "Bounded automated paper-trading engine (Milestone 1: Core & Replay)"
+version = "0.2.0"
+description = "Bounded automated paper-trading engine (Milestones 1-3: Core, Alpaca Paper Feed & Dashboard)"
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.10,<3.0",
     "tomli>=2.0; python_version < '3.11'",
+    "httpx>=0.27,<1.0",
+    "fastapi>=0.115,<1.0",
+    "uvicorn>=0.32,<1.0",
+    "python-dotenv>=1.0,<2.0",
 ]
 
 [project.optional-dependencies]

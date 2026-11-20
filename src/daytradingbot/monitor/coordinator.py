@@ -11,27 +11,31 @@ from daytradingbot.core.models import (
     MarketEvent,
     OrderRecord,
     PositionRecord,
+    WorkerHealthRecord,
     q_usd,
 )
 from daytradingbot.execution.paper_broker import BrokerTimeoutError, PaperBroker
 from daytradingbot.risk.controller import PortfolioState, RiskController
-from daytradingbot.strategy.baseline import RulesBaselineStrategy
+from daytradingbot.strategy.factory import create_strategy
+from daytradingbot.strategy.openrouter_analyst import OpenRouterStrategyAnalyst
 
 
 class TradingCoordinator:
-    """Orchestrates event dedup, strategy, risk gate, idempotent orders, and exits."""
+    """Orchestrates event dedup, strategy, optional bounded LLM review, risk gate, and exits."""
 
     def __init__(
         self,
         settings: AppSettings,
         ledger: Ledger,
         broker: PaperBroker,
-        strategy: Optional[RulesBaselineStrategy] = None,
+        strategy: Optional[Any] = None,
+        analyst: Optional[OpenRouterStrategyAnalyst] = None,
     ) -> None:
         self.settings = settings
         self.ledger = ledger
         self.broker = broker
-        self.strategy = strategy or RulesBaselineStrategy(settings.strategy)
+        self.strategy = strategy or create_strategy(settings.strategy)
+        self.analyst = analyst
         self.risk = RiskController(settings)
         self._last_bid: dict[str, Decimal] = {}
         self.startup_recover()
@@ -41,6 +45,10 @@ class TradingCoordinator:
         self.strategy.hydrate(
             self.ledger.get_recent_bar_highs(self.settings.strategy.lookback_bars)
         )
+        for q in self.ledger.get_latest_quotes():
+            bid = Decimal(str(q["bid"]))
+            if bid > Decimal("0"):
+                self._last_bid[str(q["symbol"])] = bid
         return self.reconcile_ambiguous_orders()
 
     def reconcile_ambiguous_orders(self) -> list[str]:
@@ -77,6 +85,9 @@ class TradingCoordinator:
         return reconciled
 
     def process_event(self, event: MarketEvent) -> dict[str, Any]:
+        # Always surface latest quote telemetry to the dashboard
+        self.ledger.upsert_latest_quote(event)
+
         # 1. Durable deduplication
         if self.ledger.has_event(event.event_id):
             self.ledger.log_audit(
@@ -112,19 +123,72 @@ class TradingCoordinator:
 
         # 4. Rules-only strategy proposal
         proposal = self.strategy.evaluate(event)
-        self.ledger.log_audit(
-            event.received_time,
-            "STRATEGY",
-            event.symbol,
-            event.event_id,
-            proposal.action,
-            {"reason": proposal.reason, "strategy": proposal.strategy_name},
-        )
+        if proposal.reason != "WAITING_NEXT_BAR":
+            self.ledger.log_audit(
+                event.received_time,
+                "STRATEGY",
+                event.symbol,
+                event.event_id,
+                proposal.action,
+                {"reason": proposal.reason, "strategy": proposal.strategy_name},
+            )
         if proposal.action == "NO_TRADE":
             self._snapshot_equity(event.received_time)
             return {"status": "NO_TRADE", "reason": proposal.reason}
 
-        # 5. Non-overridable risk controller
+        # 4b. Optional bounded OpenRouter LLM review (runs ONLY on candidate BUY signals)
+        if self.analyst is not None and self.settings.llm.enabled:
+            current_spend = self.ledger.get_monthly_api_spend_usd()
+            review = self.analyst.review(proposal, event, current_spend)
+            if review.cost_usd > Decimal("0"):
+                self.ledger.add_api_spend_usd(review.cost_usd)
+
+            self._record_analyst_health(event.received_time, review)
+
+            if review.status == "OK" and review.decision is not None:
+                mode_tag = self.settings.llm.mode.upper()
+                self.ledger.log_audit(
+                    event.received_time,
+                    "LLM_ANALYST",
+                    event.symbol,
+                    event.event_id,
+                    f"{mode_tag}_{review.decision.verdict}",
+                    {
+                        "model": review.model,
+                        "confidence": review.decision.confidence,
+                        "reason": review.decision.rationale,
+                        "cost_usd": str(review.cost_usd),
+                        "latency_ms": review.latency_ms,
+                    },
+                )
+                if self.settings.llm.mode == "filter":
+                    if review.decision.verdict == "VETO":
+                        self._snapshot_equity(event.received_time)
+                        return {
+                            "status": "LLM_VETOED",
+                            "reason": review.decision.rationale,
+                        }
+                    proposal = self.analyst.apply_bounded_tightening(proposal, review.decision)
+            else:
+                self.ledger.log_audit(
+                    event.received_time,
+                    "LLM_ANALYST",
+                    event.symbol,
+                    event.event_id,
+                    review.status,
+                    {"model": review.model, "error": review.error},
+                )
+                if (
+                    self.settings.llm.mode == "filter"
+                    and self.settings.llm.fallback_on_error == "NO_TRADE"
+                ):
+                    self._snapshot_equity(event.received_time)
+                    return {
+                        "status": "LLM_FALLBACK_NO_TRADE",
+                        "reason": review.error or review.status,
+                    }
+
+        # 5. Non-overridable risk controller (always enforces hard caps after strategy/LLM)
         portfolio = PortfolioState(
             cash_usd=self.ledger.get_cash_usd(),
             open_positions=open_positions,
@@ -167,6 +231,30 @@ class TradingCoordinator:
         self._snapshot_equity(event.received_time)
         return exec_result
 
+    def _record_analyst_health(self, ts: datetime, review: Any) -> None:
+        status_map = {
+            "OK": "OK",
+            "SKIPPED_DISABLED": "IDLE",
+            "SKIPPED_NO_KEY": "IDLE",
+            "SPEND_CAP_BLOCKED": "PAUSED",
+            "ERROR": "DEGRADED",
+        }
+        msg = (
+            f"{self.settings.llm.mode} mode ({review.model}) | cost=${review.cost_usd}"
+            if review.status == "OK"
+            else (review.error or review.status)
+        )
+        self.ledger.upsert_worker_health(
+            WorkerHealthRecord(
+                worker_name="openrouter_analyst",
+                status=status_map.get(review.status, "DEGRADED"),  # type: ignore[arg-type]
+                last_heartbeat=ts,
+                last_latency_ms=review.latency_ms,
+                consecutive_errors=1 if review.status == "ERROR" else 0,
+                message=msg,
+            )
+        )
+
     def _handle_open_position(self, pos: PositionRecord, event: MarketEvent) -> dict[str, Any]:
         quote_age = (event.received_time - event.event_time).total_seconds()
         if (
@@ -194,6 +282,8 @@ class TradingCoordinator:
             exit_reason = "TAKE_PROFIT"
         elif event.event_time >= pos.max_hold_until:
             exit_reason = "TIME_STOP"
+        elif hasattr(self.strategy, "should_exit"):
+            exit_reason = self.strategy.should_exit(event, pos)
 
         if exit_reason is None:
             return {"status": "HOLDING", "position_id": pos.position_id, "bid": str(event.bid)}

@@ -1,0 +1,57 @@
+mode = "PAPER"  # Forward paper trading with live market data. "LIVE" is hard-blocked in code.
+starting_cash_usd = "250.00"
+db_path = "data/paper_live.db"
+
+[risk]
+max_position_usd = "50.00"
+max_risk_per_trade_usd = "3.75"
+max_total_exposure_usd = "150.00"
+max_concurrent_positions = 2
+daily_loss_limit_usd = "10.00"
+max_spread_bps = "25"
+min_24h_volume_usd = "5000000"
+max_quote_age_seconds = 15
+max_monthly_api_spend_usd = "2.00"
+
+[fees]
+crypto_taker_fee_rate = "0.0025"       # 0.25% Alpaca entry-tier taker fee
+stock_sec_fee_rate = "0.0000206"       # SEC Section 31 fee on sells
+stock_finra_cat_per_share = "0.000003" # FINRA CAT fee per share
+base_slippage_bps = "3"                # 0.03% base execution slippage
+impact_factor_bps = "5000"             # Scales price impact with notional / 24h volume
+
+[strategy]
+lookback_bars = 3
+min_breakout_pct = "0.003"             # 0.30% breakout above recent 3-bar high
+order_notional_usd = "50.00"
+stop_loss_pct = "0.025"                # 2.5% stop loss
+take_profit_pct = "0.045"              # 4.5% take profit
+max_hold_seconds = 3600                # 1-hour time stop
+
+[feed]
+crypto_symbols = ["BTC/USD", "ETH/USD", "SOL/USD"]
+stock_symbols = ["SPY", "QQQ", "AAPL"]
+crypto_loc = "us"
+stock_feed = "iex"
+poll_interval_seconds = 3.0
+request_timeout_seconds = 8.0
+
+[dashboard]
+host = "127.0.0.1"
+port = 8000
+sse_interval_seconds = 2.0
+
+[llm]
+# Set enabled = true AFTER adding OPENROUTER_API_KEY to .env and setting a $2 cap on openrouter.ai.
+enabled = false
+# "shadow" = logs LLM APPROVE/VETO alongside Rules Baseline without blocking baseline trades.
+# "filter" = LLM VETO blocks the candidate before RiskController.
+mode = "shadow"
+model = "google/gemini-2.5-flash-lite"
+base_url = "https://openrouter.ai/api/v1"
+timeout_seconds = 6.0
+max_tokens = 220
+# If OpenRouter fails/times out in "filter" mode: "NO_TRADE" (fail-closed) or "BASELINE"
+fallback_on_error = "NO_TRADE"
+estimated_cost_per_1k_input_usd = "0.0001"
+estimated_cost_per_1k_output_usd = "0.0004"

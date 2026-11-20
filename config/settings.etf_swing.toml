@@ -1,0 +1,63 @@
+# Research config for the 6-ETF daily RSI(2) mean-reversion basket ($250 shared ledger).
+# NOTE: Use this with `daytradingbot.eval_portfolio` on 1Day bars.
+# Do NOT point `run_paper` (which polls 1-minute snapshots) at a 1Day-tuned strategy
+# without adding a daily-close bar scheduler first.
+mode = "REPLAY"
+starting_cash_usd = "250.00"
+db_path = "data/etf_swing_eval.db"
+
+[risk]
+max_position_usd = "50.00"
+max_risk_per_trade_usd = "3.75"
+max_total_exposure_usd = "150.00"
+max_concurrent_positions = 3
+daily_loss_limit_usd = "10.00"
+max_spread_bps = "25"
+min_24h_volume_usd = "5000000"
+max_quote_age_seconds = 15
+max_monthly_api_spend_usd = "2.00"
+
+[fees]
+crypto_taker_fee_rate = "0.0025"
+stock_sec_fee_rate = "0.0000206"
+stock_finra_cat_per_share = "0.000003"
+base_slippage_bps = "3"
+impact_factor_bps = "5000"
+
+[strategy]
+strategy_type = "mean_reversion"
+lookback_bars = 3
+min_breakout_pct = "0.003"
+order_notional_usd = "50.00"
+stop_loss_pct = "0.030"
+take_profit_pct = "0.050"
+max_hold_seconds = 864000
+trend_ma_bars = 200
+rsi_period = 2
+rsi_entry_below = "15"
+rsi_exit_above = "65"
+mean_exit_sma_bars = 10
+
+[feed]
+crypto_symbols = []
+stock_symbols = ["SPY", "IWM", "XLE", "XLF", "GLD", "TLT"]
+crypto_loc = "us"
+stock_feed = "iex"
+poll_interval_seconds = 3.0
+request_timeout_seconds = 8.0
+
+[dashboard]
+host = "127.0.0.1"
+port = 8000
+sse_interval_seconds = 2.0
+
+[llm]
+enabled = false
+mode = "shadow"
+model = "google/gemini-2.5-flash-lite"
+base_url = "https://openrouter.ai/api/v1"
+timeout_seconds = 6.0
+max_tokens = 220
+fallback_on_error = "NO_TRADE"
+estimated_cost_per_1k_input_usd = "0.0001"
+estimated_cost_per_1k_output_usd = "0.0004"
